@@ -6,16 +6,42 @@
 #include <algorithm>
 #include <set>
 #include <cwctype> 
-#include <msclr/marshal_cppstd.h> 
 
-// Kütüphaneleri linkle
+
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "psapi.lib") 
 
-// ==========================================
-// 1. KISIM: NATIVE C++ (Sistem & RAM)
-// ==========================================
+using namespace System;
+using namespace System::Runtime::InteropServices; 
+
+
+
+
+static std::wstring ToNativeString(System::String^ sysStr) {
+    if (System::String::IsNullOrEmpty(sysStr)) return std::wstring(L"");
+
+   
+    IntPtr ip = Marshal::StringToHGlobalUni(sysStr);
+    std::wstring str = static_cast<const wchar_t*>(ip.ToPointer());
+    Marshal::FreeHGlobal(ip); 
+    return str;
+}
+
+static std::set<std::wstring> GetWhitelist() {
+    return {
+        L"explorer.exe", L"svchost.exe", L"csrss.exe", L"winlogon.exe",
+        L"dwm.exe", L"system", L"registry", L"smss.exe", L"services.exe",
+        L"lsass.exe", L"wininit.exe", L"spoolsv.exe", L"taskhostw.exe",
+        L"contextfreezerfinal.exe"
+    };
+}
+
+bool IsCriticalProcess(std::wstring name) {
+    std::set<std::wstring> whitelist = GetWhitelist();
+    std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return std::towlower(c); });
+    return whitelist.count(name) > 0;
+}
 
 struct ProcessInfo {
     std::wstring name;
@@ -46,19 +72,32 @@ static std::vector<ProcessInfo> GetTopMemoryProcesses() {
                     pi.name = pe32.szExeFile;
                     pi.pid = pe32.th32ProcessID;
                     pi.memoryUsage = pmc.WorkingSetSize;
-
-                    if (pi.memoryUsage > 10 * 1024 * 1024) {
-                        processList.push_back(pi);
-                    }
+                    if (pi.memoryUsage > 10 * 1024 * 1024) processList.push_back(pi);
                 }
                 CloseHandle(hProcess);
             }
         } while (Process32NextW(hProcessSnap, &pe32));
     }
     CloseHandle(hProcessSnap);
-
     std::sort(processList.begin(), processList.end(), CompareProcessInfo);
     return processList;
+}
+
+static bool IsProcessRunning(std::wstring processName) {
+    HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcessSnap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe32; pe32.dwSize = sizeof(PROCESSENTRY32W);
+    bool found = false;
+    if (Process32FirstW(hProcessSnap, &pe32)) {
+        do {
+            std::wstring current = pe32.szExeFile;
+            std::transform(current.begin(), current.end(), current.begin(), [](wchar_t c) { return std::towlower(c); });
+            std::transform(processName.begin(), processName.end(), processName.begin(), [](wchar_t c) { return std::towlower(c); });
+            if (current == processName) { found = true; break; }
+        } while (Process32NextW(hProcessSnap, &pe32));
+    }
+    CloseHandle(hProcessSnap);
+    return found;
 }
 
 static std::vector<DWORD> GetPidsNative(std::wstring processName) {
@@ -66,18 +105,14 @@ static std::vector<DWORD> GetPidsNative(std::wstring processName) {
     HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hProcessSnap == INVALID_HANDLE_VALUE) return pids;
 
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32W);
-
+    PROCESSENTRY32W pe32; pe32.dwSize = sizeof(PROCESSENTRY32W);
     if (Process32FirstW(hProcessSnap, &pe32)) {
         do {
             std::wstring currentName = pe32.szExeFile;
+            if (IsCriticalProcess(currentName)) continue;
 
-            std::transform(currentName.begin(), currentName.end(), currentName.begin(),
-                [](wchar_t c) { return std::towlower(c); });
-
-            std::transform(processName.begin(), processName.end(), processName.begin(),
-                [](wchar_t c) { return std::towlower(c); });
+            std::transform(currentName.begin(), currentName.end(), currentName.begin(), [](wchar_t c) { return std::towlower(c); });
+            std::transform(processName.begin(), processName.end(), processName.begin(), [](wchar_t c) { return std::towlower(c); });
 
             if (currentName.find(processName) != std::wstring::npos) {
                 pids.push_back(pe32.th32ProcessID);
@@ -99,16 +134,12 @@ static bool TrimMemoryNative(DWORD pid) {
 static void SuspendNative(DWORD pid) {
     HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (hThreadSnap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te32;
-    te32.dwSize = sizeof(THREADENTRY32);
+    THREADENTRY32 te32; te32.dwSize = sizeof(THREADENTRY32);
     if (Thread32First(hThreadSnap, &te32)) {
         do {
             if (te32.th32OwnerProcessID == pid) {
                 HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te32.th32ThreadID);
-                if (hThread) {
-                    SuspendThread(hThread);
-                    CloseHandle(hThread);
-                }
+                if (hThread) { SuspendThread(hThread); CloseHandle(hThread); }
             }
         } while (Thread32Next(hThreadSnap, &te32));
     }
@@ -118,16 +149,12 @@ static void SuspendNative(DWORD pid) {
 static void ResumeNative(DWORD pid) {
     HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (hThreadSnap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te32;
-    te32.dwSize = sizeof(THREADENTRY32);
+    THREADENTRY32 te32; te32.dwSize = sizeof(THREADENTRY32);
     if (Thread32First(hThreadSnap, &te32)) {
         do {
             if (te32.th32OwnerProcessID == pid) {
                 HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te32.th32ThreadID);
-                if (hThread) {
-                    ResumeThread(hThread);
-                    CloseHandle(hThread);
-                }
+                if (hThread) { ResumeThread(hThread); CloseHandle(hThread); }
             }
         } while (Thread32Next(hThreadSnap, &te32));
     }
@@ -135,20 +162,14 @@ static void ResumeNative(DWORD pid) {
 }
 
 static void GetDebugPrivilege() {
-    HANDLE hToken;
-    TOKEN_PRIVILEGES tp;
-    LUID luid;
+    HANDLE hToken; TOKEN_PRIVILEGES tp; LUID luid;
     OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken);
     LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid);
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    tp.PrivilegeCount = 1; tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
     AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
 }
 
-// ==========================================
-// 2. KISIM: WINDOWS FORMS ARAYUZU
-// ==========================================
+
 using namespace System;
 using namespace System::ComponentModel;
 using namespace System::Collections;
@@ -160,6 +181,19 @@ using namespace System::IO;
 
 namespace ContextFreezerGUI {
 
+    public ref class ProfileData {
+    public:
+        List<String^>^ Apps;
+        String^ TriggerApp;
+        bool AutoFrozen;
+
+        ProfileData() {
+            Apps = gcnew List<String^>();
+            TriggerApp = "";
+            AutoFrozen = false;
+        }
+    };
+
     public ref class MyForm : public System::Windows::Forms::Form
     {
     public:
@@ -167,7 +201,7 @@ namespace ContextFreezerGUI {
         {
             InitializeComponent();
             GetDebugPrivilege();
-            InitializeData();
+            LoadConfig();
             UpdateLanguage();
         }
 
@@ -175,6 +209,15 @@ namespace ContextFreezerGUI {
         ~MyForm()
         {
             if (components) delete components;
+        }
+
+        void OnFormClosing(System::Windows::Forms::FormClosingEventArgs^ e) override {
+            SaveConfig();
+            if (e->CloseReason == CloseReason::UserClosing) {
+                e->Cancel = true;
+                this->Hide();
+                notifyIcon->ShowBalloonTip(3000, "ContextFreezer", (isTr ? "Arka planda calisiyor..." : "Running in background..."), ToolTipIcon::Info);
+            }
         }
 
     private:
@@ -185,7 +228,6 @@ namespace ContextFreezerGUI {
             }
         }
 
-    private:
         Panel^ leftPanel;
         Panel^ centerPanel;
         Panel^ rightPanel;
@@ -194,8 +236,13 @@ namespace ContextFreezerGUI {
         ListBox^ listProfiles;
         TextBox^ txtNewProfile;
         Button^ btnAddProfile;
-        Button^ btnExport;
-        Button^ btnImport;
+
+        GroupBox^ grpAuto;
+        Label^ lblTriggerInfo;
+        TextBox^ txtTriggerApp;
+        Button^ btnSetTrigger;
+        Timer^ autoTimer;
+        CheckBox^ chkAutoMode;
 
         Label^ lblSelectedProfile;
         Button^ btnFreeze;
@@ -207,27 +254,47 @@ namespace ContextFreezerGUI {
         ListView^ listMonitor;
         Button^ btnAddFromMonitor;
         Button^ btnRefreshMonitor;
+        Button^ btnExport;
+        Button^ btnImport;
+
+        NotifyIcon^ notifyIcon;
+        System::Windows::Forms::ContextMenuStrip^ trayMenu;
 
         System::ComponentModel::Container^ components;
-        Dictionary<String^, List<String^>^>^ profiles;
+        Dictionary<String^, ProfileData^>^ profiles;
         bool isTr = true;
+        String^ configPath = "profiles.cfg";
 
         void InitializeComponent(void)
         {
             this->components = gcnew System::ComponentModel::Container();
-            this->Size = System::Drawing::Size(1150, 650);
-            this->Text = L"ContextFreezer v4.4 Final";
+            this->Size = System::Drawing::Size(1200, 700);
+            this->Text = L"ContextFreezer v5.2 Final";
             this->StartPosition = FormStartPosition::CenterScreen;
             this->FormBorderStyle = System::Windows::Forms::FormBorderStyle::FixedSingle;
             this->MaximizeBox = false;
             this->BackColor = Color::FromArgb(32, 32, 32);
             this->ForeColor = Color::White;
 
+            this->notifyIcon = gcnew NotifyIcon(this->components);
+            this->notifyIcon->Icon = SystemIcons::Application;
+            this->notifyIcon->Text = "ContextFreezer";
+            this->notifyIcon->Visible = true;
+            this->notifyIcon->DoubleClick += gcnew EventHandler(this, &MyForm::OnTrayDoubleClick);
+
+            this->trayMenu = gcnew System::Windows::Forms::ContextMenuStrip();
+            this->trayMenu->Items->Add("Goster / Show", nullptr, gcnew EventHandler(this, &MyForm::OnTrayShow));
+            this->trayMenu->Items->Add("Cikis / Exit", nullptr, gcnew EventHandler(this, &MyForm::OnTrayExit));
+            this->notifyIcon->ContextMenuStrip = this->trayMenu;
+
+            this->autoTimer = gcnew Timer(this->components);
+            this->autoTimer->Interval = 3000;
+            this->autoTimer->Tick += gcnew EventHandler(this, &MyForm::OnAutoTimerTick);
+
             this->leftPanel = (gcnew Panel());
             this->centerPanel = (gcnew Panel());
             this->rightPanel = (gcnew Panel());
 
-            // --- 1. SOL PANEL (HATA DÜZELTİLDİ: Padding açıkça belirtildi) ---
             this->leftPanel->Dock = DockStyle::Left;
             this->leftPanel->Width = 240;
             this->leftPanel->BackColor = Color::FromArgb(40, 40, 40);
@@ -301,7 +368,6 @@ namespace ContextFreezerGUI {
             this->leftPanel->Controls->Add(ioPanel);
             this->leftPanel->Controls->Add(this->lblBrand);
 
-            // --- 3. SAĞ PANEL (HATA DÜZELTİLDİ) ---
             this->rightPanel->Dock = DockStyle::Right;
             this->rightPanel->Width = 350;
             this->rightPanel->BackColor = Color::FromArgb(25, 25, 25);
@@ -353,7 +419,6 @@ namespace ContextFreezerGUI {
             this->rightPanel->Controls->Add(spacerMonitor2);
             this->rightPanel->Controls->Add(this->btnAddFromMonitor);
 
-            // --- 2. ORTA PANEL (HATA DÜZELTİLDİ) ---
             this->centerPanel->Dock = DockStyle::Fill;
             this->centerPanel->Padding = System::Windows::Forms::Padding(20);
 
@@ -393,15 +458,56 @@ namespace ContextFreezerGUI {
             this->btnThaw->FlatAppearance->BorderSize = 0;
             this->btnThaw->Click += gcnew EventHandler(this, &MyForm::OnThaw);
 
+            this->grpAuto = (gcnew GroupBox());
+            this->grpAuto->Location = System::Drawing::Point(20, 130);
+            this->grpAuto->Size = System::Drawing::Size(490, 80);
+            this->grpAuto->ForeColor = Color::Orange;
+            this->grpAuto->Text = "GAME BOOSTER (Auto-Trigger)";
+
+            this->lblTriggerInfo = (gcnew Label());
+            this->lblTriggerInfo->Location = System::Drawing::Point(15, 25);
+            this->lblTriggerInfo->Size = System::Drawing::Size(120, 20);
+            this->lblTriggerInfo->Text = "Tetikleyici (.exe):";
+            this->lblTriggerInfo->ForeColor = Color::White;
+
+            this->txtTriggerApp = (gcnew TextBox());
+            this->txtTriggerApp->Location = System::Drawing::Point(140, 22);
+            this->txtTriggerApp->Size = System::Drawing::Size(250, 20);
+            this->txtTriggerApp->BackColor = Color::FromArgb(50, 50, 50);
+            this->txtTriggerApp->ForeColor = Color::White;
+            this->txtTriggerApp->BorderStyle = System::Windows::Forms::BorderStyle::FixedSingle;
+
+            this->btnSetTrigger = (gcnew Button());
+            this->btnSetTrigger->Text = "KAYDET";
+            this->btnSetTrigger->Location = System::Drawing::Point(400, 20);
+            this->btnSetTrigger->Size = System::Drawing::Size(80, 24);
+            this->btnSetTrigger->FlatStyle = FlatStyle::Flat;
+            this->btnSetTrigger->BackColor = Color::Orange;
+            this->btnSetTrigger->ForeColor = Color::Black;
+            this->btnSetTrigger->Click += gcnew EventHandler(this, &MyForm::OnSetTrigger);
+
+            this->chkAutoMode = (gcnew CheckBox());
+            this->chkAutoMode->Text = "OTOMATIK MODU AKTIFLESTIR (Arka Planda Tarar)";
+            this->chkAutoMode->Location = System::Drawing::Point(20, 50);
+            this->chkAutoMode->AutoSize = true;
+            this->chkAutoMode->ForeColor = Color::LightGreen;
+            this->chkAutoMode->CheckedChanged += gcnew EventHandler(this, &MyForm::OnAutoCheckChanged);
+
+            this->grpAuto->Controls->Add(this->chkAutoMode);
+            this->grpAuto->Controls->Add(this->btnSetTrigger);
+            this->grpAuto->Controls->Add(this->txtTriggerApp);
+            this->grpAuto->Controls->Add(this->lblTriggerInfo);
+
             this->logBox = (gcnew RichTextBox());
-            this->logBox->Location = System::Drawing::Point(20, 140);
-            this->logBox->Size = System::Drawing::Size(490, 450);
+            this->logBox->Location = System::Drawing::Point(20, 230);
+            this->logBox->Size = System::Drawing::Size(490, 400);
             this->logBox->BackColor = Color::FromArgb(20, 20, 20);
             this->logBox->ForeColor = Color::LimeGreen;
             this->logBox->BorderStyle = System::Windows::Forms::BorderStyle::None;
             this->logBox->Font = (gcnew System::Drawing::Font(L"Consolas", 10));
             this->logBox->ReadOnly = true;
 
+            this->centerPanel->Controls->Add(this->grpAuto);
             this->centerPanel->Controls->Add(this->btnLangSwitch);
             this->centerPanel->Controls->Add(this->logBox);
             this->centerPanel->Controls->Add(this->btnThaw);
@@ -417,59 +523,96 @@ namespace ContextFreezerGUI {
             if (isTr) {
                 lblBrand->Text = "PROFILLER";
                 btnAddProfile->Text = "+ Yeni Profil";
-                btnImport->Text = "Ice Aktar";
-                btnExport->Text = "Disa Aktar";
-                btnFreeze->Text = "DONDUR (Freeze)";
-                btnThaw->Text = "UYANDIR (Thaw)";
+                btnFreeze->Text = "DONDUR";
+                btnThaw->Text = "UYANDIR";
                 lblMonitorHeader->Text = "> SYSTEM_MONITOR";
-                btnRefreshMonitor->Text = "YENILE / TARA";
+                btnRefreshMonitor->Text = "YENILE";
                 btnAddFromMonitor->Text = "<< SECILENI EKLE";
                 btnLangSwitch->Text = "EN";
+                grpAuto->Text = "GAME BOOSTER (Auto-Trigger)";
+                lblTriggerInfo->Text = "Tetikleyici (.exe):";
+                btnSetTrigger->Text = "KAYDET";
+                chkAutoMode->Text = "OTOMATIK MODU AKTIFLESTIR";
+                btnImport->Text = "Ice Aktar";
+                btnExport->Text = "Disa Aktar";
             }
             else {
                 lblBrand->Text = "PROFILES";
                 btnAddProfile->Text = "+ New Profile";
-                btnImport->Text = "Import";
-                btnExport->Text = "Export";
                 btnFreeze->Text = "FREEZE";
                 btnThaw->Text = "THAW";
                 lblMonitorHeader->Text = "> SYSTEM_MONITOR";
-                btnRefreshMonitor->Text = "REFRESH / SCAN";
+                btnRefreshMonitor->Text = "REFRESH";
                 btnAddFromMonitor->Text = "<< ADD SELECTED";
                 btnLangSwitch->Text = "TR";
+                grpAuto->Text = "GAME BOOSTER (Auto-Trigger)";
+                lblTriggerInfo->Text = "Trigger App (.exe):";
+                btnSetTrigger->Text = "SAVE";
+                chkAutoMode->Text = "ENABLE AUTO MODE";
+                btnImport->Text = "Import";
+                btnExport->Text = "Export";
             }
         }
 
-        void InitializeData() {
-            profiles = gcnew Dictionary<String^, List<String^>^>();
+        void SaveConfig() {
+            try {
+                StreamWriter^ sw = gcnew StreamWriter(configPath);
+                for each(auto item in profiles) {
+                    sw->Write(item.Key + "=" + item.Value->TriggerApp + "|");
+                    for (int i = 0; i < item.Value->Apps->Count; i++) {
+                        sw->Write(item.Value->Apps[i]);
+                        if (i < item.Value->Apps->Count - 1) sw->Write(",");
+                    }
+                    sw->WriteLine();
+                }
+                sw->Close();
+            }
+            catch (...) {}
+        }
 
-            // OYUN MODU DEFAULT
-            List<String^>^ gameMode = gcnew List<String^>();
-            gameMode->Add("SearchApp.exe");
-            gameMode->Add("OfficeClickToRun.exe");
-            gameMode->Add("OneDrive.exe");
-            gameMode->Add("PhoneExperienceHost.exe");
-            gameMode->Add("Cortana.exe");
-            gameMode->Add("MicrosoftEdgeUpdate.exe");
-            gameMode->Add("SkypeApp.exe");
-            gameMode->Add("Calculator.exe");
-            gameMode->Add("PhotosApp.exe");
-            gameMode->Add("YourPhone.exe");
-            gameMode->Add("Widgets.exe");
+        void LoadConfig() {
+            if (!File::Exists(configPath)) {
+                profiles = gcnew Dictionary<String^, ProfileData^>();
+                ProfileData^ p = gcnew ProfileData();
+                p->Apps->Add("SearchApp.exe"); p->Apps->Add("OneDrive.exe");
+                profiles["Oyun Modu"] = p;
+                UpdateProfileList();
+                return;
+            }
 
-            profiles["Oyun Modu (Default)"] = gameMode;
-            UpdateProfileList();
-            RefreshMonitorList();
+            profiles = gcnew Dictionary<String^, ProfileData^>();
+            try {
+                StreamReader^ sr = gcnew StreamReader(configPath);
+                String^ line;
+                while ((line = sr->ReadLine()) != nullptr) {
+                    array<String^>^ mainParts = line->Split('=');
+                    if (mainParts->Length == 2) {
+                        String^ pName = mainParts[0];
+                        array<String^>^ dataParts = mainParts[1]->Split('|');
+
+                        ProfileData^ p = gcnew ProfileData();
+                        if (dataParts->Length > 0) p->TriggerApp = dataParts[0];
+
+                        if (dataParts->Length > 1) {
+                            array<String^>^ apps = dataParts[1]->Split(',');
+                            for each(String ^ app in apps) if (!String::IsNullOrWhiteSpace(app)) p->Apps->Add(app);
+                        }
+                        profiles[pName] = p;
+                    }
+                }
+                sr->Close();
+                UpdateProfileList();
+            }
+            catch (...) {}
         }
 
         void RefreshMonitorList() {
             listMonitor->Items->Clear();
             std::vector<ProcessInfo> topApps = GetTopMemoryProcesses();
-
             for (const auto& app : topApps) {
-                String^ name = msclr::interop::marshal_as<String^>(app.name);
+                
+                String^ name = gcnew String(app.name.c_str());
                 double mb = app.memoryUsage / (1024.0 * 1024.0);
-
                 ListViewItem^ item = gcnew ListViewItem(name);
                 item->SubItems->Add(mb.ToString("F1") + " MB");
                 listMonitor->Items->Add(item);
@@ -491,7 +634,7 @@ namespace ContextFreezerGUI {
         void OnAddProfile(Object^ sender, EventArgs^ e) {
             String^ name = txtNewProfile->Text;
             if (!String::IsNullOrWhiteSpace(name) && !profiles->ContainsKey(name)) {
-                profiles[name] = gcnew List<String^>();
+                profiles[name] = gcnew ProfileData();
                 UpdateProfileList();
                 txtNewProfile->Text = "";
             }
@@ -500,34 +643,128 @@ namespace ContextFreezerGUI {
         void OnProfileChanged(Object^ sender, EventArgs^ e) {
             if (listProfiles->SelectedItem != nullptr) {
                 String^ selected = listProfiles->SelectedItem->ToString();
+                ProfileData^ p = profiles[selected];
+
                 lblSelectedProfile->Text = (isTr ? "Secili: " : "Selected: ") + selected;
+                txtTriggerApp->Text = p->TriggerApp;
 
                 logBox->Clear();
                 LogToScreen("--- " + selected + " ---");
-                for each(String ^ app in profiles[selected]) {
+                if (p->TriggerApp != "") LogToScreen("AUTO-TRIGGER: " + p->TriggerApp);
+                for each(String ^ app in p->Apps) {
                     LogToScreen(">> " + app);
                 }
             }
         }
 
-        void OnRefreshMonitor(Object^ sender, EventArgs^ e) {
-            RefreshMonitorList();
+        void OnTrayDoubleClick(Object^ sender, EventArgs^ e) { this->Show(); this->WindowState = FormWindowState::Normal; }
+        void OnTrayShow(Object^ sender, EventArgs^ e) { this->Show(); this->WindowState = FormWindowState::Normal; }
+        void OnTrayExit(Object^ sender, EventArgs^ e) { SaveConfig(); Application::Exit(); }
+
+        void OnSetTrigger(Object^ sender, EventArgs^ e) {
+            if (listProfiles->SelectedItem == nullptr) return;
+            String^ selected = listProfiles->SelectedItem->ToString();
+            profiles[selected]->TriggerApp = txtTriggerApp->Text;
+            MessageBox::Show("Trigger Saved!");
+            SaveConfig();
         }
 
-        void OnAddFromMonitor(Object^ sender, EventArgs^ e) {
-            if (listProfiles->SelectedItem == nullptr) {
-                MessageBox::Show(isTr ? "Once profil secin!" : "Select profile first!");
-                return;
+        void OnAutoCheckChanged(Object^ sender, EventArgs^ e) {
+            if (chkAutoMode->Checked) {
+                autoTimer->Start();
+                LogToScreen("[AUTO] Scanner Started...");
             }
+            else {
+                autoTimer->Stop();
+                LogToScreen("[AUTO] Scanner Stopped.");
+            }
+        }
+
+        void OnAutoTimerTick(Object^ sender, EventArgs^ e) {
+            for each(auto item in profiles) {
+                ProfileData^ p = item.Value;
+                if (String::IsNullOrWhiteSpace(p->TriggerApp)) continue;
+
+           
+                std::wstring wTrigger = ToNativeString(p->TriggerApp);
+                bool isRunning = IsProcessRunning(wTrigger);
+
+                if (isRunning && !p->AutoFrozen) {
+                    p->AutoFrozen = true;
+                    LogToScreen("[AUTO] " + p->TriggerApp + " Detected! Freezing " + item.Key + "...");
+                    FreezeProfile(item.Key);
+                }
+                else if (!isRunning && p->AutoFrozen) {
+                    p->AutoFrozen = false;
+                    LogToScreen("[AUTO] " + p->TriggerApp + " Closed. Thawing " + item.Key + "...");
+                    ThawProfile(item.Key);
+                }
+            }
+        }
+
+        void OnRefreshMonitor(Object^ sender, EventArgs^ e) { RefreshMonitorList(); }
+
+        void OnAddFromMonitor(Object^ sender, EventArgs^ e) {
+            if (listProfiles->SelectedItem == nullptr) return;
             if (listMonitor->SelectedItems->Count == 0) return;
 
             String^ appName = listMonitor->SelectedItems[0]->Text;
-            String^ currentProfile = listProfiles->SelectedItem->ToString();
+      
+            std::wstring wAppName = ToNativeString(appName);
 
-            if (!profiles[currentProfile]->Contains(appName)) {
-                profiles[currentProfile]->Add(appName);
+            if (IsCriticalProcess(wAppName)) {
+                MessageBox::Show("Bu sistem dosyasi dondurulamaz!", "GUVENLIK UYARISI", MessageBoxButtons::OK, MessageBoxIcon::Error);
+                return;
+            }
+
+            String^ currentProfile = listProfiles->SelectedItem->ToString();
+            if (!profiles[currentProfile]->Apps->Contains(appName)) {
+                profiles[currentProfile]->Apps->Add(appName);
                 OnProfileChanged(nullptr, nullptr);
             }
+        }
+
+        void FreezeProfile(String^ profileName) {
+            List<String^>^ apps = profiles[profileName]->Apps;
+            for each(String ^ app in apps) {
+             
+                std::wstring nativeName = ToNativeString(app);
+                std::vector<DWORD> pids = GetPidsNative(nativeName);
+                if (!pids.empty()) {
+                    for (DWORD pid : pids) {
+                        SuspendNative(pid);
+                        TrimMemoryNative(pid);
+                        LogToScreen("[*] " + app + " -> FREEZED");
+                    }
+                }
+            }
+        }
+
+        void ThawProfile(String^ profileName) {
+            List<String^>^ apps = profiles[profileName]->Apps;
+            for each(String ^ app in apps) {
+         
+                std::wstring nativeName = ToNativeString(app);
+                std::vector<DWORD> pids = GetPidsNative(nativeName);
+                for (DWORD pid : pids) {
+                    ResumeNative(pid);
+                    LogToScreen("[+] " + app + " -> ACTIVE");
+                }
+            }
+        }
+
+        void OnFreeze(Object^ sender, EventArgs^ e) {
+            if (listProfiles->SelectedItem == nullptr) return;
+            LogToScreen("\n[ FREEZING... ]");
+            FreezeProfile(listProfiles->SelectedItem->ToString());
+            LogToScreen("--- DONE ---");
+        }
+
+        void OnThaw(Object^ sender, EventArgs^ e) {
+            if (listProfiles->SelectedItem == nullptr) return;
+            LogToScreen("\n[ THAWING... ]");
+            ThawProfile(listProfiles->SelectedItem->ToString());
+            LogToScreen("--- DONE ---");
         }
 
         void OnExport(Object^ sender, EventArgs^ e) {
@@ -537,10 +774,10 @@ namespace ContextFreezerGUI {
             if (sfd->ShowDialog() == System::Windows::Forms::DialogResult::OK) {
                 StreamWriter^ sw = gcnew StreamWriter(sfd->FileName);
                 for each(auto item in profiles) {
-                    sw->Write(item.Key + "=");
-                    for (int i = 0; i < item.Value->Count; i++) {
-                        sw->Write(item.Value[i]);
-                        if (i < item.Value->Count - 1) sw->Write(",");
+                    sw->Write(item.Key + "=" + item.Value->TriggerApp + "|");
+                    for (int i = 0; i < item.Value->Apps->Count; i++) {
+                        sw->Write(item.Value->Apps[i]);
+                        if (i < item.Value->Apps->Count - 1) sw->Write(",");
                     }
                     sw->WriteLine();
                 }
@@ -557,20 +794,24 @@ namespace ContextFreezerGUI {
                 StreamReader^ sr = gcnew StreamReader(ofd->FileName);
                 String^ line;
                 while ((line = sr->ReadLine()) != nullptr) {
-                    array<String^>^ parts = line->Split('=');
-                    if (parts->Length == 2) {
-                        String^ pName = parts[0];
-                        String^ pApps = parts[1];
+                    array<String^>^ mainParts = line->Split('=');
+                    if (mainParts->Length == 2) {
+                        String^ pName = mainParts[0];
+                        array<String^>^ dataParts = mainParts[1]->Split('|');
 
-                        if (!profiles->ContainsKey(pName)) {
-                            profiles[pName] = gcnew List<String^>();
+                        ProfileData^ p = gcnew ProfileData();
+                        if (dataParts->Length > 0) p->TriggerApp = dataParts[0];
+
+                        if (dataParts->Length > 1) {
+                            array<String^>^ apps = dataParts[1]->Split(',');
+                            for each(String ^ app in apps) if (!String::IsNullOrWhiteSpace(app)) p->Apps->Add(app);
                         }
 
-                        array<String^>^ apps = pApps->Split(',');
-                        for each(String ^ app in apps) {
-                            if (!String::IsNullOrWhiteSpace(app) && !profiles[pName]->Contains(app)) {
-                                profiles[pName]->Add(app);
-                            }
+                        if (!profiles->ContainsKey(pName)) {
+                            profiles[pName] = p;
+                        }
+                        else {
+                            profiles[pName] = p; 
                         }
                     }
                 }
@@ -578,49 +819,6 @@ namespace ContextFreezerGUI {
                 UpdateProfileList();
                 MessageBox::Show(isTr ? "Profiller Yuklendi!" : "Profiles Imported!");
             }
-        }
-
-        void OnFreeze(Object^ sender, EventArgs^ e) {
-            if (listProfiles->SelectedItem == nullptr) return;
-
-            String^ profileName = listProfiles->SelectedItem->ToString();
-            List<String^>^ apps = profiles[profileName];
-
-            LogToScreen("\n[ FREEZING... ]");
-
-            for each(String ^ app in apps) {
-                std::wstring nativeName = msclr::interop::marshal_as<std::wstring>(app);
-                std::vector<DWORD> pids = GetPidsNative(nativeName);
-
-                if (pids.empty()) {
-                    // Log bos kalmasin
-                }
-                else {
-                    for (DWORD pid : pids) {
-                        SuspendNative(pid);
-                        bool trimmed = TrimMemoryNative(pid);
-                        LogToScreen("[*] " + app + " (" + pid.ToString() + ") -> FREEZED");
-                    }
-                }
-            }
-            LogToScreen("--- DONE ---");
-        }
-
-        void OnThaw(Object^ sender, EventArgs^ e) {
-            if (listProfiles->SelectedItem == nullptr) return;
-            String^ profileName = listProfiles->SelectedItem->ToString();
-            List<String^>^ apps = profiles[profileName];
-            LogToScreen("\n[ THAWING... ]");
-
-            for each(String ^ app in apps) {
-                std::wstring nativeName = msclr::interop::marshal_as<std::wstring>(app);
-                std::vector<DWORD> pids = GetPidsNative(nativeName);
-                for (DWORD pid : pids) {
-                    ResumeNative(pid);
-                    LogToScreen("[+] " + app + " (" + pid.ToString() + ") -> ACTIVE");
-                }
-            }
-            LogToScreen("--- DONE ---");
         }
     };
 }
